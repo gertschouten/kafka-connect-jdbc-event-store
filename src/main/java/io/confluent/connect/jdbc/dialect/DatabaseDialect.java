@@ -558,4 +558,22 @@ public interface DatabaseDialect extends ConnectionProvider {
      */
     Object convert(ResultSet resultSet) throws SQLException, IOException;
   }
+
+  void cleanupFlush(
+          Connection connection
+  ) throws SQLException;
+
+
+  String buildPrecommitStatement(
+          JdbcSinkConfig.InsertMode insertMode,
+          TableId table,
+          Collection<ColumnId> upsertKeyColumns,
+          Collection<ColumnId> nonKeyColumns,
+          TableDefinition definition
+  ) throws SQLException;
+
+  String buildPrecommitCleanupStatement(
+          TableId table
+  ) throws SQLException;
+
 }

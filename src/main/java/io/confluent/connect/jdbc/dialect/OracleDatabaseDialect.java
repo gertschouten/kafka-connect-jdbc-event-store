@@ -16,8 +16,9 @@
 package io.confluent.connect.jdbc.dialect;
 
 import io.confluent.connect.jdbc.dialect.DatabaseDialectProvider.SubprotocolBasedProvider;
+import io.confluent.connect.jdbc.sink.JdbcSinkConfig;
 import io.confluent.connect.jdbc.sink.JdbcSinkConfig.InsertMode;
-import io.confluent.connect.jdbc.sink.PreparedStatementBinder;
+import io.confluent.connect.jdbc.sink.OraclePreparedStatementBinder;
 import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
 import io.confluent.connect.jdbc.sink.metadata.SchemaPair;
 import io.confluent.connect.jdbc.sink.metadata.SinkRecordField;
@@ -30,7 +31,6 @@ import org.apache.kafka.connect.data.Timestamp;
 import org.apache.kafka.connect.data.Schema.Type;
 import org.apache.kafka.connect.errors.ConnectException;
 
-import java.io.ByteArrayInputStream;
 import java.io.StringReader;
 import java.nio.ByteBuffer;
 import java.sql.*;
@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * A {@link DatabaseDialect} for Oracle.
@@ -87,7 +88,7 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
       InsertMode insertMode,
       Boolean coordinates
   ) {
-    return new PreparedStatementBinder(
+    return new OraclePreparedStatementBinder(
         this,
         statement,
         schemaPair,
@@ -132,7 +133,7 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
 
     if (schema.type() == Type.STRING) {
       if (colDef.type() == Types.BLOB) {
-        statement.setObject(index, ((String)value).getBytes());
+        statement.setBytes(index, ((String)value).getBytes());
         return true;
       } else if (colDef.type() == Types.CLOB) {
         statement.setCharacterStream(index, new StringReader((String) value));
@@ -150,9 +151,9 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
 
     if (schema.type() == Type.BYTES && colDef.type() == Types.BLOB) {
       if (value instanceof ByteBuffer) {
-        statement.setBlob(index, new ByteArrayInputStream(((ByteBuffer) value).array()));
+        statement.setBytes(index, ((ByteBuffer) value).array());
       } else if (value instanceof byte[]) {
-        statement.setBlob(index, new ByteArrayInputStream((byte[]) value));
+        statement.setBytes(index, ((byte[]) value));
       } else {
         return super.maybeBindPrimitive(statement, index, schema, value);
       }
@@ -235,14 +236,6 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
     builder.append(table);
     builder.append(" (");
     writeColumnsSpec(builder, fields);
-    builder.append(",");
-    builder.append(System.lineSeparator());
-    builder.append("CONSTRAINT ");
-    builder.append(table.tableName());
-    builder.append("_ensure_json ");
-    builder.append("CHECK (");
-    builder.appendColumnName(converterPayloadFieldName());
-    builder.append(" IS JSON)");
     builder.append(")");
     if (!distributionAttributes().isEmpty()) {
       builder.append(System.lineSeparator());
@@ -287,6 +280,41 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
       builder.append(")");
     }
     builder.append(";");
+
+    fields = Stream.concat(Stream.of(new SinkRecordField(Schema.INT32_SCHEMA, "fastingestsourcepartition", false)),
+            fields.stream()).collect(Collectors.toList());
+    //final List<String> pkFieldNames = extractPrimaryKeyFieldNames(fields);
+    builder.append("CREATE TABLE ");
+    builder.append(table.tableName() + "_load");
+    builder.append(" (");
+    writeColumnsSpec(builder, fields);
+    builder.append(")");
+    builder.append(System.lineSeparator());
+    builder.append(" SEGMENT CREATION IMMEDIATE ");
+    builder.append(System.lineSeparator());
+    builder.append(" MEMOPTIMIZE FOR WRITE ");
+    //builder.append("INMEMORY");
+    /*if (!distributionAttributes().isEmpty()) {
+      builder.append(System.lineSeparator());
+      builder.append("PARTITION BY HASH (");
+      builder.appendList()
+              .delimitedBy(",")
+              .transformedBy(ExpressionBuilder.quote())
+              .of(distributionAttributes());
+      builder.append(")");
+      builder.append("(");
+      for (int i=0; i<partitions(); i++) {
+        builder.append(System.lineSeparator());
+        builder.append("PARTITION ");
+        builder.append(table.tableName());
+        builder.append("_h");
+        builder.append(i);
+        if (i < partitions()-1) {builder.append(",");}
+      }
+      builder.append(")");
+    }*/
+    builder.append(";");
+
     return builder.toString();
   }
 
@@ -345,4 +373,147 @@ public class OracleDatabaseDialect extends GenericDatabaseDialect {
                 .replaceAll("(:thin:[^/]*)/([^@]*)@", "$1/****@")
                 .replaceAll("(:oci[^:]*:[^/]*)/([^@]*)@", "$1/****@");
   }
+  @Override
+  public String buildInsertStatement(
+          TableId table,
+          Collection<ColumnId> nonKeyColumns,
+          TableDefinition definition
+  ) {
+    ExpressionBuilder builder = expressionBuilder();
+    builder.append("INSERT INTO ");
+    builder.append("/*+ MEMOPTIMIZE_WRITE */ ");
+    builder.append(table.tableName() + "_load");
+    builder.append("(");
+    builder.append("fastingestsourcepartition, ");
+    builder.appendList()
+            .delimitedBy(",")
+            .transformedBy(ExpressionBuilder.columnNames())
+            .of(nonKeyColumns);
+    builder.append(") VALUES(");
+    builder.appendMultiple(",", "?", nonKeyColumns.size() + 1);
+    builder.append(")");
+    return builder.toString();
+  }
+
+  @Override
+  public String buildPrecommitStatement(
+          JdbcSinkConfig.InsertMode insertMode,
+          TableId table,
+          Collection<ColumnId> upsertKeyColumns,
+          Collection<ColumnId> nonKeyColumns,
+          TableDefinition definition
+  ) throws SQLException {
+    ExpressionBuilder builder;
+
+    switch (insertMode) {
+      case INSERT:
+      case UPSERT:
+        builder = expressionBuilder();
+        builder.append(" INSERT ");
+        builder.append(" /*+append */ ");
+        builder.append(" INTO ");
+        builder.append(table);
+        builder.append(System.lineSeparator());
+        /*builder.append(" PARTITION FOR (");
+        builder.appendList()
+                .delimitedBy(",")
+                .transformedBy(ExpressionBuilder.quote())
+                .of(distributionAttributes());
+        builder.append(")");
+        builder.append(System.lineSeparator());*/
+        builder.append(" SELECT ");
+        builder.appendList()
+                .delimitedBy(",")
+                .transformedBy(ExpressionBuilder.columnNames())
+                .of(nonKeyColumns);
+        builder.append(" FROM ");
+        builder.append(table.tableName() + "_load ");
+        builder.append("WHERE ");
+        builder.append(" fastingestsourcepartition = ? ");
+        return builder.toString();
+
+      case UPDATE:
+        builder = expressionBuilder();
+        builder.append(" MERGE ");
+        builder.append(" INTO ");
+        builder.append(table);
+        builder.append(" T1 ");
+        builder.append(System.lineSeparator());
+        builder.append(" USING (");
+        builder.append(" SELECT ");
+        builder.appendList()
+                .delimitedBy(",")
+                .transformedBy(ExpressionBuilder.columnNames())
+                .of(nonKeyColumns);
+        builder.append(" FROM ");
+        builder.append(table.tableName() + "_load ");
+        builder.append("WHERE ");
+        builder.append(" fastingestsourcepartition = ? ) T2 ");
+        builder.append(System.lineSeparator());
+        builder.append("ON( ");
+        builder.appendList()
+                .delimitedBy(" AND ")
+                .transformedBy(transform)
+                .of(upsertKeyColumns);
+        builder.append(") T2 ");
+        builder.append(" WHEN MATCHED THEN UPDATE SET ");
+        builder.appendList()
+                .delimitedBy(" AND ")
+                .transformedBy(transform)
+                .of(nonKeyColumns);
+
+        return builder.toString();
+      default:
+        return null;
+    }
+  }
+
+  final ExpressionBuilder.Transform<ColumnId> transform = (builder, col) -> {
+    builder.append("T1.")
+            .appendColumnName(col.name())
+            .append("=T2.")
+            .appendColumnName(col.name());
+  };
+
+  @Override
+  public String buildPrecommitCleanupStatement(
+          TableId table
+  ) throws SQLException {
+    ExpressionBuilder builder;
+        builder = expressionBuilder();
+        builder.append(" DELETE FROM ");
+        builder.append(table.tableName() + "_load ");
+        builder.append(" WHERE ");
+        builder.append(" fastingestsourcepartition = ? ");
+        return builder.toString();
+  }
+
+  @Override
+  public String buildUpdateStatement(
+          TableId table,
+          Collection<ColumnId> keyColumns,
+          Collection<ColumnId> nonKeyColumns,
+          TableDefinition definition
+  ) {
+    return buildInsertStatement(table, nonKeyColumns, definition);
+  }
+
+  @Override
+  public void cleanupFlush(
+          Connection connection
+  ) throws SQLException  {
+    try (Statement stmt = connection.createStatement()){
+      stmt.execute("CALL DBMS_MEMOPTIMIZE.WRITE_END()");
+    }
+  }
+
+  @Override
+  public PreparedStatement createPreparedStatement(
+          Connection db,
+          String query
+  ) throws SQLException {
+    PreparedStatement stmt = db.prepareStatement(query);
+    return stmt;
+  }
+
 }

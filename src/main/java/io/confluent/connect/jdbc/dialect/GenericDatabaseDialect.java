@@ -196,6 +196,32 @@ public class GenericDatabaseDialect implements DatabaseDialect {
   }
 
   @Override
+  public void cleanupFlush(
+          Connection connection
+  ) throws SQLException {
+
+  }
+
+
+  @Override
+  public String buildPrecommitStatement(
+          JdbcSinkConfig.InsertMode insertMode,
+          TableId table,
+          Collection<ColumnId> upsertKeyColumns,
+          Collection<ColumnId> nonKeyColumns,
+          TableDefinition definition
+  ) throws SQLException {
+    return null;
+  }
+
+  @Override
+  public String buildPrecommitCleanupStatement(
+          TableId table
+  ) throws SQLException {
+    return null;
+  }
+
+  @Override
   public void close() {
     Connection conn;
     while ((conn = connections.poll()) != null) {

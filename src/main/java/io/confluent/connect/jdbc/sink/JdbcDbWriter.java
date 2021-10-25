@@ -44,6 +44,7 @@ public class JdbcDbWriter {
         config.connectionAttempts,
         config.connectionBackoffMs
     );
+
   }
 
   protected CachedConnectionProvider connectionProvider(int maxConnAttempts, long retryBackoff) {
@@ -58,9 +59,11 @@ public class JdbcDbWriter {
 
   void write(final Collection<SinkRecord> records) throws SQLException, TableAlterOrCreateException {
     final Connection connection = cachedConnectionProvider.getConnection();
+
     log.debug("Received {} sink records", records.size());
     BufferedRecords buffer = null;
     TableId tableId = null;
+
     for (SinkRecord record : records) {
       record.headers().clear();
       if (tableId == null) {
@@ -69,6 +72,7 @@ public class JdbcDbWriter {
       if (buffer == null) {
         buffer = new BufferedRecords(config, tableId, dbDialect, dbStructure, connection);
       }
+
       if(config.insertMode != JdbcSinkConfig.InsertMode.INSERT) {
         if (config.insertMode == JdbcSinkConfig.InsertMode.UPSERT && record.value() != null) {
           record.headers().addBoolean("UPSERTDELETE", true);
@@ -78,6 +82,9 @@ public class JdbcDbWriter {
     }
       log.debug("Flushing records in JDBC Writer for table ID: {}", tableId);
       buffer.flush();
+
+      buffer.preCommit();
+
       buffer.close();
       connection.commit();
   }

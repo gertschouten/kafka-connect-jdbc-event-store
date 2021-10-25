@@ -54,6 +54,8 @@ public class BufferedRecords {
   private Schema valueSchema;
   private RecordValidator recordValidator;
   private FieldsMetadata fieldsMetadata;
+  private PreparedStatement preCommitPreparedStatement;
+  private PreparedStatement preCommitCleanupPreparedStatement;
   private PreparedStatement updatePreparedStatement;
   private PreparedStatement deletePreparedStatement;
   private PreparedStatement upsertDeletePreparedStatement;
@@ -64,6 +66,7 @@ public class BufferedRecords {
   private boolean upsertDeletesInBatch = false;
   private boolean updatesInBatch = false;
   private final HashSet<Object> keys;
+  private final HashSet<Integer> partitions;
 
   public BufferedRecords(
       JdbcSinkConfig config,
@@ -79,6 +82,7 @@ public class BufferedRecords {
     this.connection = connection;
     this.recordValidator = RecordValidator.create(config);
     this.keys = new HashSet<>();
+    this.partitions = new HashSet<>();
   }
 
   public List<SinkRecord> add(SinkRecord record) throws SQLException {
@@ -154,13 +158,17 @@ public class BufferedRecords {
       final String insertSql = record.valueSchema() != null ? getInsertSql() : null;
       final String deleteSql = config.deleteEnabled ? getDeleteSql(fieldsMetadata.deleteKeyFieldNames) : null;
       final String upsertDeleteSql = record.valueSchema() != null && config.insertMode == UPSERT ? getDeleteSql(fieldsMetadata.upsertKeyFieldNames) : null;
+      final String preCommitSql = getPrecommitSql();
+      final String preCommitCleanupSql = getPrecommitCleanupSql();
 
       log.debug(
-          "{} sql: {} deleteSql: {} upsertDeleteSql: {} meta: {}",
+          "{} sql: {} deleteSql: {} upsertDeleteSql: {} preCommitSql: {} preCommitCleanupSql: {} meta: {}",
           config.insertMode,
           insertSql,
           deleteSql,
           upsertDeleteSql,
+          preCommitSql,
+          preCommitCleanupSql,
           fieldsMetadata
       );
       close();
@@ -186,6 +194,10 @@ public class BufferedRecords {
                   config.coordinatesEnabled
           );
         }
+      }
+      if (nonNull(preCommitSql)) {
+        preCommitPreparedStatement = (dbDialect.createPreparedStatement(connection, preCommitSql));
+        preCommitCleanupPreparedStatement = (dbDialect.createPreparedStatement(connection, preCommitCleanupSql));
       }
 
       if (/*config.deleteEnabled && */nonNull(deleteSql)) {
@@ -237,13 +249,21 @@ public class BufferedRecords {
       return new ArrayList<>();
     }
     log.debug("Flushing {} buffered records", records.size());
+
+    int count = 0;
     for (SinkRecord r : records) {
+      count++;
+      if (records.size() > 1 && count % 500 == 0) {
+        log.debug("Bound {} buffered records", count);
+      }
       if (isNull(r.value())) {
         if (nonNull(deleteStatementBinder)) {
           deleteStatementBinder.bindRecord(r);
         }
       } else {
-        if (r.headers().allWithName("UPSERTDELETE").hasNext()) {
+        partitions.add(r.kafkaPartition());
+
+        if (!r.headers().isEmpty() && r.headers().allWithName("UPSERTDELETE").hasNext()) {
           if (nonNull(upsertDeleteStatementBinder)) {
             upsertDeleteStatementBinder.bindRecord(r);
             r.headers().clear();
@@ -254,8 +274,15 @@ public class BufferedRecords {
         }
       }
     }
-      Optional<Long> totalUpdateCount = executeUpdates();
+    for (Integer p : partitions) {
+      preCommitCleanupPreparedStatement.setInt(1, p);
+      preCommitCleanupPreparedStatement.addBatch();
+    }
+
+    Optional<Long> totalUpdateCount = executeUpdates();
       long totalDeleteCount = executeDeletes();
+
+      dbDialect.cleanupFlush(connection);
 
       final long expectedCount = updateRecordCount();
       log.debug("{} records:{} resulting in totalUpdateCount:{} totalDeleteCount:{}",
@@ -291,6 +318,7 @@ public class BufferedRecords {
    */
   private Optional<Long> executeUpdates() throws SQLException {
     Optional<Long> count = Optional.empty();
+    log.debug("Executing batch for {} sink records", records.size());
 
     if (config.insertMode == UPSERT) {
       if (upsertDeletesInBatch) {
@@ -306,7 +334,29 @@ public class BufferedRecords {
         }
       }
     }
+    log.debug("Finished executing batch for {} sink records", records.size());
     return count;
+  }
+
+  protected void preCommit() throws SQLException {
+    if (nonNull(preCommitPreparedStatement)) {
+      log.debug("Precommitting");
+      for (Integer p : partitions) {
+        preCommitPreparedStatement.setInt(1, p);
+        preCommitPreparedStatement.execute();
+        connection.commit();
+      }
+      preCommitPreparedStatement.executeBatch();
+      log.debug("Precommitted");
+      log.debug("Cleaning up");
+
+      for (Integer p : partitions) {
+        preCommitCleanupPreparedStatement.setInt(1, p);
+        preCommitCleanupPreparedStatement.addBatch();
+      }
+      preCommitCleanupPreparedStatement.executeBatch();
+      log.debug("Cleaned up {} sink records", records.size());
+    }
   }
 
   private long executeUpsertDeletes() throws SQLException {
@@ -343,10 +393,19 @@ public class BufferedRecords {
 
   public void close() throws SQLException {
     log.debug(
-        "Closing BufferedRecords with updatePreparedStatement: {} deletePreparedStatement: {}",
+        "Closing BufferedRecords with updatePreparedStatement: {} deletePreparedStatement: {} preCommitPreparedStatement {}",
         updatePreparedStatement,
-        deletePreparedStatement
+        deletePreparedStatement,
+        preCommitPreparedStatement
     );
+    if (nonNull(preCommitPreparedStatement)) {
+      preCommitPreparedStatement.close();
+      preCommitPreparedStatement = null;
+    }
+    if (nonNull(preCommitCleanupPreparedStatement)) {
+      preCommitCleanupPreparedStatement.close();
+      preCommitCleanupPreparedStatement = null;
+    }
     if (nonNull(updatePreparedStatement)) {
       updatePreparedStatement.close();
       updatePreparedStatement = null;
@@ -385,6 +444,36 @@ public class BufferedRecords {
       default:
         throw new ConnectException("Invalid insert mode");
     }
+  }
+
+  private String getPrecommitSql() throws SQLException {
+    switch (config.insertMode) {
+      case INSERT:
+      case UPSERT:
+        return dbDialect.buildPrecommitStatement(
+                config.insertMode,
+                tableId,
+                null,
+                asColumns(fieldsMetadata.nonKeyFieldNames),
+                dbStructure.tableDefinition(connection, tableId)
+        );
+      case UPDATE:
+        return dbDialect.buildPrecommitStatement(
+                config.insertMode,
+                tableId,
+                asColumns(fieldsMetadata.upsertKeyFieldNames),
+                asColumns(fieldsMetadata.nonKeyFieldNames),
+                dbStructure.tableDefinition(connection, tableId)
+        );
+      default:
+        return null;
+    }
+  }
+
+  private String getPrecommitCleanupSql() throws SQLException {
+        return dbDialect.buildPrecommitCleanupStatement(
+                tableId
+        );
   }
 
   private String getDeleteSql(Set<String> keyFieldNames) {
