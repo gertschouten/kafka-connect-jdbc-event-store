@@ -1,4 +1,0 @@
-io.confluent.connect.jdbc.dialect.GenericDatabaseDialect$Provider
-io.confluent.connect.jdbc.dialect.OracleDatabaseDialect$Provider
-io.confluent.connect.jdbc.dialect.PostgreSqlDatabaseDialect$Provider
-io.confluent.connect.jdbc.dialect.NetezzaSqlDatabaseDialect$Provider
